@@ -1,0 +1,189 @@
+---
+# =============================================================================
+# find_service_port.yml
+# Découverte du port et PID d'un service (Bare metal, Docker, Podman)
+# Support : Linux (ss, docker, podman) et Windows (PowerShell)
+# =============================================================================
+# UTILISATION — Linux :
+#   ansible-playbook playbooks/find_service_port.yml \
+#     -e "service_name=nginx" \
+#     -e "target_os=linux" \
+#     -i inventaire.yml
+#
+# UTILISATION — Windows :
+#   ansible-playbook playbooks/find_service_port.yml \
+#     -e "service_name=explorer" \
+#     -e "target_os=windows" \
+#     -i inventaire.yml
+#
+# VARIABLES OBLIGATOIRES :
+#   service_name : Le nom du processus, du service ou du conteneur à chercher.
+#   target_os    : "linux" ou "windows"
+# =============================================================================
+
+- name: "Recherche de port et PID pour un service donné"
+  # Ce playbook cible l'ensemble des hôtes spécifiés. Par défaut "all".
+  # Assurez-vous de filtrer avec --limit ou via l'inventaire.
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: "[PRE-01] Vérifier les variables obligatoires"
+      assert:
+        that:
+          - service_name is defined and service_name | length > 0
+          - target_os is defined and target_os in ['linux', 'windows']
+        fail_msg: |
+          ❌ Variables manquantes ou invalides.
+             Obligatoires : service_name, target_os (linux|windows)
+        success_msg: "✅ Variables obligatoires OK. Recherche de '{{ service_name }}' sur {{ target_os }}"
+      tags: [always, preflight]
+
+    # =========================================================================
+    # BLOC WINDOWS
+    # =========================================================================
+    - name: "[WINDOWS] Rechercher le processus et les ports associés"
+      win_shell: |
+        $service = "{{ service_name }}"
+        $procs = Get-Process -Name $service -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id
+        
+        $results = @()
+        if ($procs -ne $null) {
+            foreach ($p in $procs) {
+                # Chercher les connexions TCP en écoute (Listen) associées à ce PID
+                $conns = Get-NetTCPConnection | Where-Object { $_.OwningProcess -eq $p -and $_.State -eq 'Listen' }
+                if ($conns -ne $null) {
+                    foreach ($c in $conns) {
+                        $results += [PSCustomObject]@{
+                            ProcessName = $service
+                            PID         = $p
+                            LocalPort   = $c.LocalPort
+                            Environment = "BareMetal (Windows)"
+                        }
+                    }
+                } else {
+                    # Le processus existe mais n'écoute sur aucun port
+                    $results += [PSCustomObject]@{
+                        ProcessName = $service
+                        PID         = $p
+                        LocalPort   = "None"
+                        Environment = "BareMetal (Windows)"
+                    }
+                }
+            }
+        }
+        $results | ConvertTo-Json -Compress
+      register: win_search_result
+      when: target_os == 'windows'
+      tags: [windows]
+
+    - name: "[WINDOWS] Traiter les résultats JSON"
+      set_fact:
+        parsed_results: "{{ win_search_result.stdout | default('[]') | from_json }}"
+      when: target_os == 'windows'
+      tags: [windows]
+
+    # =========================================================================
+    # BLOC LINUX
+    # =========================================================================
+    - name: "[LINUX] Rechercher le processus et les ports associés (BareMetal, Docker, Podman)"
+      shell: |
+        #!/bin/bash
+        SERVICE="{{ service_name }}"
+        RESULTS="["
+
+        # 1. Recherche BareMetal (ss -tulpn)
+        # Note: On ignore docker-proxy pour ne pas dupliquer avec la détection Docker
+        BAREMETAL_LINES=$(ss -tulpn | grep -i "$SERVICE" | grep -v 'docker-proxy')
+        while read -r line; do
+          if [ -n "$line" ]; then
+            # Exemple: tcp LISTEN 0 128 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=3456,fd=6))
+            PORT=$(echo "$line" | awk '{print $5}' | awk -F':' '{print $NF}')
+            PID=$(echo "$line" | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2)
+            NAME=$(echo "$line" | grep -o '"[^"]*"' | head -n1 | tr -d '"')
+            
+            # Fallback name if not extracted
+            if [ -z "$NAME" ]; then NAME="$SERVICE"; fi
+
+            if [ -n "$PORT" ] && [ -n "$PID" ]; then
+               RESULTS="$RESULTS {\"ProcessName\":\"$NAME\", \"PID\":\"$PID\", \"LocalPort\":\"$PORT\", \"Environment\":\"BareMetal (Linux)\"},"
+            fi
+          fi
+        done <<< "$BAREMETAL_LINES"
+
+        # 2. Recherche Docker
+        if command -v docker >/dev/null 2>&1; then
+          # Vérifier si le daemon Docker répond
+          if docker info >/dev/null 2>&1; then
+            CONTAINERS=$(docker ps --format '{{ "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}" }}' | grep -i "$SERVICE")
+            while read -r line; do
+              if [ -n "$line" ]; then
+                CID=$(echo "$line" | cut -d'|' -f1)
+                CNAME=$(echo "$line" | cut -d'|' -f2)
+                CPORTS=$(echo "$line" | cut -d'|' -f4)
+                
+                # Récupérer le PID principal du conteneur
+                CPID=$(docker inspect -f '{{ "{{.State.Pid}}" }}' $CID 2>/dev/null)
+                
+                RESULTS="$RESULTS {\"ProcessName\":\"$CNAME (Docker)\", \"PID\":\"$CPID\", \"LocalPort\":\"$CPORTS\", \"Environment\":\"Docker\"},"
+              fi
+            done <<< "$CONTAINERS"
+          fi
+        fi
+
+        # 3. Recherche Podman
+        if command -v podman >/dev/null 2>&1; then
+          CONTAINERS=$(podman ps --format '{{ "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}" }}' | grep -i "$SERVICE")
+          while read -r line; do
+            if [ -n "$line" ]; then
+              CID=$(echo "$line" | cut -d'|' -f1)
+              CNAME=$(echo "$line" | cut -d'|' -f2)
+              CPORTS=$(echo "$line" | cut -d'|' -f4)
+              
+              CPID=$(podman inspect -f '{{ "{{.State.Pid}}" }}' $CID 2>/dev/null)
+              
+              RESULTS="$RESULTS {\"ProcessName\":\"$CNAME (Podman)\", \"PID\":\"$CPID\", \"LocalPort\":\"$CPORTS\", \"Environment\":\"Podman\"},"
+            fi
+          done <<< "$CONTAINERS"
+        fi
+
+        # Nettoyage JSON : retirer la dernière virgule si présente et fermer le tableau
+        RESULTS="${RESULTS%,}"
+        RESULTS="$RESULTS]"
+        if [ "$RESULTS" = "]" ]; then
+          RESULTS="[]"
+        fi
+        
+        echo "$RESULTS"
+      register: linux_search_result
+      become: true
+      when: target_os == 'linux'
+      tags: [linux]
+
+    - name: "[LINUX] Traiter les résultats JSON"
+      set_fact:
+        parsed_results: "{{ linux_search_result.stdout | default('[]') | from_json }}"
+      when: target_os == 'linux'
+      tags: [linux]
+
+    # =========================================================================
+    # AFFICHAGE DU RÉSULTAT
+    # =========================================================================
+    - name: "Afficher les résultats de la recherche"
+      debug:
+        msg: |
+          ============================================================
+          🔍 RÉSULTATS DE RECHERCHE POUR : {{ service_name }}
+          ============================================================
+          {% if parsed_results | length == 0 %}
+          Aucun processus ou port trouvé pour '{{ service_name }}' sur {{ inventory_hostname }}.
+          {% else %}
+          {% for item in parsed_results %}
+          - Environnement : {{ item.Environment }}
+            Nom/Processus : {{ item.ProcessName }}
+            PID           : {{ item.PID }}
+            Port Local    : {{ item.LocalPort }}
+          {% endfor %}
+          {% endif %}
+          ============================================================
+      tags: [always, report]

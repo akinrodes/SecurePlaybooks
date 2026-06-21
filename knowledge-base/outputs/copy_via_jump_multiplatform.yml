@@ -1,0 +1,380 @@
+---
+# =============================================================================
+# copy_via_jump_multiplatform.yml
+# Copie sécurisée d'un fichier A → C via bastion B
+# Support : A/B/C peuvent être Linux OU Windows
+# =============================================================================
+# Référentiels : ANSSI BP-028 (SSH), NIST SP 800-53 SC-8, CM-3
+#
+# PRÉREQUIS :
+#   - A (controller) : Linux ou Windows + WSL2 (Ansible tourne dans WSL2)
+#   - B (bastion)    : OpenSSH Server installé (Linux natif, Windows via Get-WindowsCapability)
+#   - C (destination): OpenSSH Server installé si Windows, SSH standard si Linux
+#
+# INSTALLATION OpenSSH sur Windows (B ou C) :
+#   Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+#   Start-Service sshd
+#   Set-Service -Name sshd -StartupType Automatic
+#   # Ouvrir le port firewall
+#   New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True `
+#     -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
+#
+# UTILISATION — Linux destination (dest_os=linux) :
+#   ansible-playbook playbooks/copy_via_jump_multiplatform.yml \
+#     -e "src_file=/home/user/rapport.pdf" \
+#     -e "dest_file=/opt/data/rapport.pdf" \
+#     -e "dest_os=linux" \
+#     -e "jump_host_ip=10.0.1.10" \
+#     -e "jump_host_user=bastionuser" \
+#     -e "dest_host_ip=10.0.2.20" \
+#     -e "dest_host_user=serveruser"
+#
+# UTILISATION — Windows destination (dest_os=windows) :
+#   ansible-playbook playbooks/copy_via_jump_multiplatform.yml \
+#     -e "src_file=/home/user/rapport.pdf" \
+#     -e 'dest_file=C:\Data\rapport.pdf' \
+#     -e "dest_os=windows" \
+#     -e "jump_host_ip=10.0.1.10" \
+#     -e "jump_host_user=bastionuser" \
+#     -e "dest_host_ip=10.0.2.20" \
+#     -e "dest_host_user=DOMAINE\\serveruser"
+#
+# VARIABLES OBLIGATOIRES :
+#   src_file        : chemin absolu du fichier source sur le controller (A)
+#   dest_file       : chemin absolu destination sur C (Linux: /opt/... | Windows: C:\...)
+#   dest_os         : "linux" ou "windows" — OS du serveur destination C
+#   jump_host_ip    : IP du bastion B
+#   jump_host_user  : utilisateur SSH sur B
+#   dest_host_ip    : IP du serveur C
+#   dest_host_user  : utilisateur SSH sur C
+#
+# VARIABLES OPTIONNELLES :
+#   dest_host_port  : port SSH de C                (défaut: 22)
+#   jump_host_port  : port SSH de B                (défaut: 22)
+#   ssh_key_file    : clé privée SSH               (défaut: ~/.ssh/id_ed25519)
+#   dest_file_owner : propriétaire sur C Linux     (défaut: dest_host_user)
+#   dest_file_group : groupe sur C Linux           (défaut: dest_host_user)
+#   dest_file_mode  : permissions sur C Linux      (défaut: '0640')
+#   backup_existing : sauvegarder si fichier existe(défaut: true)
+# =============================================================================
+
+# =============================================================================
+# PLAY 1 — Pré-vol : validation, checksum source, construction inventaire dynamique
+# =============================================================================
+- name: "PRÉ-VOL — Validation des variables, checksum source, préparation inventaire"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    default_dest_host_port:  "{{ dest_host_port  | default('22') }}"
+    default_jump_host_port:  "{{ jump_host_port  | default('22') }}"
+    default_ssh_key_file:    "{{ ssh_key_file    | default('~/.ssh/id_ed25519') }}"
+    default_dest_file_owner: "{{ dest_file_owner | default(dest_host_user) }}"
+    default_dest_file_group: "{{ dest_file_group | default('') }}"
+    default_dest_file_mode:  "{{ dest_file_mode  | default('0640') }}"
+    default_backup_existing: "{{ backup_existing | default(true) }}"
+
+  tasks:
+    # ------------------------------------------------------------------
+    - name: "[PRE-01] Vérifier les variables obligatoires"
+      assert:
+        that:
+          - src_file is defined        and src_file        | length > 0
+          - dest_file is defined       and dest_file       | length > 0
+          - dest_os is defined         and dest_os         in ['linux', 'windows']
+          - jump_host_ip is defined    and jump_host_ip    | length > 0
+          - jump_host_user is defined  and jump_host_user  | length > 0
+          - dest_host_ip is defined    and dest_host_ip    | length > 0
+          - dest_host_user is defined  and dest_host_user  | length > 0
+        fail_msg: |
+          ❌ Variables manquantes ou invalides.
+             Obligatoires : src_file, dest_file, dest_os (linux|windows),
+                            jump_host_ip, jump_host_user, dest_host_ip, dest_host_user
+        success_msg: "✅ Variables obligatoires OK — dest_os={{ dest_os }}"
+      tags: [always, preflight]
+
+    # ------------------------------------------------------------------
+    - name: "[PRE-02] Vérifier l'existence du fichier source sur le controller"
+      stat:
+        path: "{{ src_file }}"
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: src_stat
+      tags: [always, preflight]
+
+    - name: "[PRE-03] Échec si le fichier source est introuvable"
+      assert:
+        that:
+          - src_stat.stat.exists
+          - src_stat.stat.isreg
+        fail_msg: "❌ Fichier source '{{ src_file }}' introuvable ou n'est pas un fichier régulier"
+        success_msg: "✅ Fichier source OK : {{ src_file }} ({{ src_stat.stat.size }} octets)"
+      tags: [always, preflight]
+
+    # ------------------------------------------------------------------
+    - name: "[PRE-04] Résumé de l'opération"
+      debug:
+        msg: |
+          ============================================================
+          OPÉRATION : Copie sécurisée A → B → C
+          ============================================================
+          📁 Source (A/controller) : {{ src_file }}
+          📏 Taille                : {{ src_stat.stat.size }} octets
+          🔐 SHA256 source         : {{ src_stat.stat.checksum }}
+          🖥️  Bastion (B)           : {{ jump_host_user }}@{{ jump_host_ip }}:{{ default_jump_host_port }}
+          🖥️  Destination (C)       : {{ dest_host_user }}@{{ dest_host_ip }}:{{ default_dest_host_port }}
+          🖥️  OS destination (C)    : {{ dest_os | upper }}
+          📂 Chemin destination     : {{ dest_file }}
+          ============================================================
+      tags: [always, preflight]
+
+    # ------------------------------------------------------------------
+    # Construction de l'inventaire dynamique pour C
+    # SSH pour Linux ET Windows (OpenSSH natif Windows Server 2019+)
+    # ProxyJump : tunnel chiffré direct A→C, aucun shell intermédiaire sur B
+    # ForwardAgent no : sécurité ANSSI — clé compromise sur B ne pivot pas vers C
+    # Ciphers/MACs/KexAlgorithms : conformes recommandations ANSSI SSH
+    # ------------------------------------------------------------------
+    - name: "[PRE-05] Enregistrer C dans l'inventaire dynamique (ProxyJump via B)"
+      add_host:
+        name: "dest_server_c"
+        # Transport SSH dans tous les cas
+        # Pour Windows : OpenSSH Server doit être installé sur C
+        ansible_connection:   ssh
+        ansible_host:         "{{ dest_host_ip }}"
+        ansible_port:         "{{ default_dest_host_port }}"
+        ansible_user:         "{{ dest_host_user }}"
+        ansible_private_key_file: "{{ default_ssh_key_file }}"
+
+        # Shell adapté à l'OS de C
+        # Linux : sh/bash | Windows : powershell
+        ansible_shell_type: "{{ 'sh' if dest_os == 'linux' else 'powershell' }}"
+
+        # Options SSH sécurisées — ANSSI BP-028
+        ansible_ssh_common_args: >-
+          -o ProxyCommand="ssh -W %h:%p -q -i '{{ default_ssh_key_file }}' -o StrictHostKeyChecking=no {{ jump_host_user }}@{{ jump_host_ip }} -p {{ default_jump_host_port }}"
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+          -o ForwardAgent=no
+          -o ServerAliveInterval=30
+          -o ServerAliveCountMax=3
+          -o ConnectTimeout=15
+          -o Ciphers=chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+          -o MACs=hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+          -o KexAlgorithms=curve25519-sha256,diffie-hellman-group16-sha512
+
+        # Contexte transmis au Play 2 via hostvars
+        ctx_src_file:        "{{ src_file }}"
+        ctx_dest_file:       "{{ dest_file }}"
+        ctx_dest_os:         "{{ dest_os }}"
+        ctx_src_checksum:    "{{ src_stat.stat.checksum }}"
+        ctx_src_size:        "{{ src_stat.stat.size }}"
+        ctx_file_owner:      "{{ default_dest_file_owner }}"
+        ctx_file_group:      "{{ default_dest_file_group }}"
+        ctx_file_mode:       "{{ default_dest_file_mode }}"
+        ctx_backup:          "{{ default_backup_existing }}"
+      tags: [always, preflight]
+
+# =============================================================================
+# PLAY 2A — Copie vers destination LINUX
+# Modules : copy, stat, file
+# =============================================================================
+- name: "COPIE vers C LINUX — transit chiffré via bastion B (ProxyJump)"
+  hosts: dest_server_c
+  gather_facts: false
+
+  # Ne s'exécute que si dest_os == linux
+  # La condition est évaluée via hostvars car les vars extra ne sont pas disponibles directement ici
+  tasks:
+    - name: "[LINUX-01] Vérifier la connectivité SSH A→B→C (Linux)"
+      wait_for_connection:
+        timeout: 30
+        sleep: 2
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, connectivity]
+
+    - name: "[LINUX-02] Collecter les infos nécessaires sur C"
+      setup:
+        gather_subset: ['hardware']
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, facts]
+
+    - name: "[LINUX-03] Vérifier l'espace disque disponible sur C"
+      assert:
+        that:
+          - (ansible_mounts | selectattr('mount', 'equalto', '/') | list | length == 0) or (ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first > (hostvars['dest_server_c']['ctx_src_size'] | int * 2))
+        fail_msg: "❌ Espace disque insuffisant sur C pour {{ hostvars['dest_server_c']['ctx_src_size'] }} octets"
+        success_msg: "✅ Espace disque suffisant"
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, preflight]
+
+    - name: "[LINUX-04] Créer le répertoire destination si nécessaire"
+      file:
+        path:  "{{ hostvars['dest_server_c']['ctx_dest_file'] | dirname }}"
+        state: directory
+      become: true
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, filesystem]
+
+    - name: "[LINUX-05] Copier le fichier de A vers C Linux (via ProxyJump B)"
+      copy:
+        src:      "{{ hostvars['dest_server_c']['ctx_src_file'] }}"
+        dest:     "{{ hostvars['dest_server_c']['ctx_dest_file'] }}"
+        owner:    "{{ hostvars['dest_server_c']['ctx_file_owner'] }}"
+        group:    "{{ hostvars['dest_server_c']['ctx_file_group'] if hostvars['dest_server_c']['ctx_file_group'] != '' else omit }}"
+        mode:     "{{ hostvars['dest_server_c']['ctx_file_mode'] }}"
+        backup:   "{{ hostvars['dest_server_c']['ctx_backup'] | bool }}"
+      become: true
+      register: linux_copy_result
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, transfer]
+
+    - name: "[LINUX-06] Calculer SHA256 du fichier déposé sur C Linux"
+      stat:
+        path: "{{ hostvars['dest_server_c']['ctx_dest_file'] }}"
+        checksum_algorithm: sha256
+        get_checksum: true
+      register: linux_dest_stat
+      become: true
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, integrity]
+
+    - name: "[LINUX-07] Vérifier intégrité SHA256 (source == destination)"
+      assert:
+        that:
+          - linux_dest_stat.stat.checksum == hostvars['dest_server_c']['ctx_src_checksum']
+          - linux_dest_stat.stat.mode     == hostvars['dest_server_c']['ctx_file_mode']
+          - linux_dest_stat.stat.pw_name  == hostvars['dest_server_c']['ctx_file_owner']
+        fail_msg: |
+          ❌ INTEGRITY FAILURE — Le fichier reçu sur C ne correspond pas à la source !
+             SHA256 attendu : {{ hostvars['dest_server_c']['ctx_src_checksum'] }}
+             SHA256 reçu    : {{ linux_dest_stat.stat.checksum }}
+          ⚠️  Incident potentiel — vérifier le bastion B.
+        success_msg: "✅ Intégrité OK : SHA256 {{ linux_dest_stat.stat.checksum }}"
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, integrity]
+
+    - name: "[LINUX-08] Rapport final — copie Linux réussie"
+      debug:
+        msg: |
+          ============================================================
+          ✅  COPIE LINUX RÉUSSIE — Intégrité vérifiée
+          ============================================================
+          Source       : {{ hostvars['dest_server_c']['ctx_src_file'] }}
+          Bastion B    : {{ hostvars['dest_server_c']['ansible_host'] }}
+          Destination  : {{ hostvars['dest_server_c']['ctx_dest_file'] }}
+          SHA256       : {{ linux_dest_stat.stat.checksum }}
+          Taille       : {{ linux_dest_stat.stat.size }} octets
+          Mode         : {{ linux_dest_stat.stat.mode }}
+          Owner        : {{ linux_dest_stat.stat.pw_name }}
+          Modifié      : {{ linux_copy_result.changed }}
+          Backup       : {{ linux_copy_result.backup_file | default('aucun') }}
+          ============================================================
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'linux'
+      tags: [linux, report]
+
+# =============================================================================
+# PLAY 2B — Copie vers destination WINDOWS
+# Modules : win_copy, win_stat, win_file
+# Prérequis C : OpenSSH Server installé (Windows Server 2019+ ou Windows 10 1809+)
+# =============================================================================
+- name: "COPIE vers C WINDOWS — transit chiffré via bastion B (ProxyJump)"
+  hosts: dest_server_c
+  gather_facts: false
+
+  tasks:
+    - name: "[WIN-01] Vérifier la connectivité SSH A→B→C (Windows + OpenSSH)"
+      wait_for_connection:
+        timeout: 45
+        sleep: 3
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      tags: [windows, connectivity]
+
+    - name: "[WIN-02] Vérifier l'espace disque sur C Windows"
+      win_shell: |
+        $drive = Split-Path -Qualifier "{{ hostvars['dest_server_c']['ctx_dest_file'] }}"
+        if (-not $drive) { $drive = "C:" }
+        $disk = Get-PSDrive ($drive -replace ':','')
+        $disk.Free
+      register: win_disk_free
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      changed_when: false
+      tags: [windows, preflight]
+
+    - name: "[WIN-03] Asserter que l'espace disque Windows est suffisant"
+      assert:
+        that:
+          - win_disk_free.stdout | trim | int > hostvars['dest_server_c']['ctx_src_size'] | int * 2
+        fail_msg: "❌ Espace disque insuffisant sur C Windows"
+        success_msg: "✅ Espace disque Windows suffisant"
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      tags: [windows, preflight]
+
+    - name: "[WIN-04] Créer le répertoire destination sur C Windows"
+      win_file:
+        path:  "{{ hostvars['dest_server_c']['ctx_dest_file'] | win_dirname }}"
+        state: directory
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      tags: [windows, filesystem]
+
+    - name: "[WIN-05] Copier le fichier de A vers C Windows (via ProxyJump B)"
+      win_copy:
+        src:    "{{ hostvars['dest_server_c']['ctx_src_file'] }}"
+        dest:   "{{ hostvars['dest_server_c']['ctx_dest_file'] }}"
+        backup: "{{ hostvars['dest_server_c']['ctx_backup'] | bool }}"
+        # win_copy vérifie automatiquement le checksum avant copie (idempotence)
+      register: win_copy_result
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      tags: [windows, transfer]
+
+    - name: "[WIN-06] Calculer le SHA256 du fichier déposé sur C Windows"
+      win_stat:
+        path:               "{{ hostvars['dest_server_c']['ctx_dest_file'] }}"
+        get_checksum:       true
+        checksum_algorithm: sha256
+      register: win_dest_stat
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      tags: [windows, integrity]
+
+    - name: "[WIN-07] Vérifier l'intégrité SHA256 (source == destination Windows)"
+      assert:
+        that:
+          - win_dest_stat.stat.checksum == hostvars['dest_server_c']['ctx_src_checksum']
+        fail_msg: |
+          ❌ INTEGRITY FAILURE — Le fichier reçu sur C Windows ne correspond pas à la source !
+             SHA256 attendu : {{ hostvars['dest_server_c']['ctx_src_checksum'] }}
+             SHA256 reçu    : {{ win_dest_stat.stat.checksum }}
+          ⚠️  Incident potentiel — vérifier le bastion B.
+        success_msg: "✅ Intégrité OK : SHA256 {{ win_dest_stat.stat.checksum }}"
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      tags: [windows, integrity]
+
+    - name: "[WIN-08] Configurer les permissions ACL sur le fichier Windows"
+      win_acl:
+        path:   "{{ hostvars['dest_server_c']['ctx_dest_file'] }}"
+        user:   "{{ hostvars['dest_server_c']['ctx_file_owner'] }}"
+        rights: FullControl
+        type:   allow
+        state:  present
+      when:
+        - hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+        - hostvars['dest_server_c']['ctx_file_owner'] != hostvars['dest_server_c']['ansible_user']
+      tags: [windows, permissions]
+
+    - name: "[WIN-09] Rapport final — copie Windows réussie"
+      debug:
+        msg: |
+          ============================================================
+          ✅  COPIE WINDOWS RÉUSSIE — Intégrité vérifiée
+          ============================================================
+          Source       : {{ hostvars['dest_server_c']['ctx_src_file'] }}
+          Bastion B    : {{ hostvars['dest_server_c']['ansible_host'] }}
+          Destination  : {{ hostvars['dest_server_c']['ctx_dest_file'] }}
+          SHA256       : {{ win_dest_stat.stat.checksum }}
+          Taille       : {{ win_dest_stat.stat.size }} octets
+          Modifié      : {{ win_copy_result.changed }}
+          Backup       : {{ win_copy_result.backup_file | default('aucun') }}
+          ============================================================
+      when: hostvars['dest_server_c']['ctx_dest_os'] == 'windows'
+      tags: [windows, report]

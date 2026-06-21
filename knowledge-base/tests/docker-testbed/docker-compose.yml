@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  bastion:
+    build:
+      context: .
+      args:
+        USERNAME: bastionuser
+    container_name: test_bastion
+    volumes:
+      # Injecter la clé publique dans authorized_keys du conteneur
+      - ./test_key.pub:/home/bastionuser/.ssh/authorized_keys:ro
+    ports:
+      # Exposer le SSH du bastion sur le port 2222 de l'hôte local (A)
+      - "2222:22"
+    networks:
+      - test_network
+
+  target:
+    build:
+      context: .
+      args:
+        USERNAME: serveruser
+    container_name: test_target
+    volumes:
+      # Injecter la même clé publique pour la cible
+      - ./test_key.pub:/home/serveruser/.ssh/authorized_keys:ro
+    networks:
+      - test_network
+
+networks:
+  test_network:
+    name: test_network
